@@ -227,10 +227,11 @@ class Game:
 
     # ── Scoring ───────────────────────────────────────────────────
 
-    def compute_scores(self) -> List[Tuple[str, int, List[str]]]:
+    def compute_scores(self) -> List[Tuple[int, int, str, int, List[str]]]:
         """Calculate final scores and return sorted results.
 
-        Returns list of (display_name, total_score, [detail_strings]) sorted desc.
+        Returns list of (place, user_id, display_name, total_score, [detail_strings])
+        sorted desc by score.  Players with equal scores share the same place.
         """
         self.phase = Phase.FINISHED
 
@@ -248,14 +249,21 @@ class Game:
                     if author_id in self.players and author_id != p.user_id:
                         self.players[author_id].score += 2
 
-        results = []
-        for p in sorted(self.players.values(), key=lambda x: x.score, reverse=True):
+        sorted_players = sorted(self.players.values(), key=lambda x: x.score, reverse=True)
+
+        results: List[Tuple[int, int, str, int, List[str]]] = []
+        prev_score: int | None = None
+        place = 0
+        for i, p in enumerate(sorted_players):
+            if p.score != prev_score:
+                place = i + 1
+                prev_score = p.score
             details: List[str] = []
             for word in self.game_words:
                 guess = p.guesses.get(word, "—")
                 correct = "✅" if guess == "dictionary" else "❌"
                 details.append(f"  {word}: {correct}")
-            results.append((p.display_name, p.score, details))
+            results.append((place, p.user_id, p.display_name, p.score, details))
         return results
 
     def get_word_results(self) -> List[Tuple[str, str, List[Tuple[str, str, List[str]]]]]:

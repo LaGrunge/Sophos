@@ -12,9 +12,10 @@ from telegram.ext import (
     filters,
 )
 
-from config import TELEGRAM_BOT_TOKEN, REQUIRED_COMMON_WORDS
+from config import TELEGRAM_BOT_TOKEN, MIN_PLAYERS, REQUIRED_COMMON_WORDS
 from dictionary_parser import parse_dictionary
 from game import Game, Phase
+import player_stats
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -50,17 +51,41 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+def _menu_keyboard_for(user_id: int) -> InlineKeyboardMarkup:
+    """Build a context-aware menu keyboard showing only valid actions."""
+    game = _find_game_for_user(user_id)
+    buttons = []
+
+    if not game or game.phase == Phase.FINISHED:
+        # Not in any active game
+        buttons.append([InlineKeyboardButton("🎲 Новая игра", callback_data="menu:newgame")])
+        buttons.append([InlineKeyboardButton("📋 Открытые комнаты", callback_data="menu:games")])
+    elif game.phase == Phase.LOBBY:
+        if game.creator_id == user_id:
+            # Creator in lobby
+            if len(game.players) >= MIN_PLAYERS:
+                buttons.append([InlineKeyboardButton("▶️ Начать игру", callback_data="menu:startgame")])
+            buttons.append([InlineKeyboardButton("📋 Открытые комнаты", callback_data="menu:games")])
+            buttons.append([InlineKeyboardButton("❌ Отменить комнату", callback_data="menu:cancel")])
+        else:
+            # Non-creator in lobby
+            buttons.append([InlineKeyboardButton("❌ Покинуть комнату", callback_data="menu:cancel")])
+    else:
+        # Active game (SELECTING / WRITING / GUESSING)
+        buttons.append([InlineKeyboardButton("❌ Выйти из игры", callback_data="menu:cancel")])
+
+    return InlineKeyboardMarkup(buttons)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dictionary = context.bot_data["dictionary"]
+    user_id = update.effective_user.id
     await update.message.reply_text(
         f"Привет! Я — бот-философ.\n"
         f"В моём словаре {len(dictionary)} статей.\n\n"
         f"Просто напиши название термина, и я найду его определение.\n\n"
-        f"🎲 Игра «Угадай определение»:\n"
-        f"/newgame — создать комнату\n"
-        f"/games — список открытых комнат\n"
-        f"/startgame — начать игру (создатель)\n"
-        f"/cancel — выйти / отменить комнату"
+        f"🎲 Игра «Угадай определение» — выберите действие:",
+        reply_markup=_menu_keyboard_for(user_id),
     )
 
 
@@ -140,47 +165,92 @@ async def _broadcast(context: ContextTypes.DEFAULT_TYPE, game: Game, text: str, 
             logger.error("Cannot DM user %s: %s", player.user_id, e)
 
 
+# ── Menu callback ─────────────────────────────────────────────
+
+async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle main-menu inline button presses."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    _, action = query.data.split(":", 1)
+
+    if action == "main":
+        dictionary = context.bot_data["dictionary"]
+        await query.edit_message_text(
+            f"Привет! Я — бот-философ.\n"
+            f"В моём словаре {len(dictionary)} статей.\n\n"
+            f"Просто напиши название термина, и я найду его определение.\n\n"
+            f"🎲 Игра «Угадай определение» — выберите действие:",
+            reply_markup=_menu_keyboard_for(user.id),
+        )
+    elif action == "newgame":
+        text = await _do_newgame(user, context)
+        await query.edit_message_text(text, reply_markup=_menu_keyboard_for(user.id))
+    elif action == "games":
+        text, kb = _build_games_keyboard(user.id)
+        await query.edit_message_text(text, reply_markup=kb)
+    elif action == "startgame":
+        err = await _do_startgame(user.id, context)
+        if err:
+            await query.edit_message_text(err, reply_markup=_menu_keyboard_for(user.id))
+        else:
+            await query.edit_message_text(
+                "🎲 Игра запущена! Проверьте личные сообщения.",
+                reply_markup=_menu_keyboard_for(user.id),
+            )
+    elif action == "cancel":
+        text = await _do_cancel(user.id, user, context)
+        await query.edit_message_text(text, reply_markup=_menu_keyboard_for(user.id))
+
+
 # ── /newgame — create a room ─────────────────────────────────
 
-async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+async def _do_newgame(user, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Core newgame logic. Returns reply text."""
     user_id = user.id
-    # Check player isn't already in a room
     existing = _find_game_for_user(user_id)
     if existing and existing.phase != Phase.FINISHED:
-        await update.message.reply_text(
+        return (
             f"Вы уже в комнате «{existing.room_name}» (#{existing.room_id}). "
-            f"Сначала выйдите: /cancel"
+            f"Сначала выйдите."
         )
-        return
     dictionary = context.bot_data["dictionary"]
     name = _name(user)
     game = Game(room_name=f"Комната {name}", creator_id=user_id, dictionary=dictionary)
     rooms[game.room_id] = game
-    # Creator auto-joins
     game.add_player(user_id, name)
-    await update.message.reply_text(
+    player_stats.record_join(user_id, name)
+    return (
         f"🎲 Комната «{game.room_name}» (#{game.room_id}) создана!\n"
         f"Вы автоматически присоединены.\n\n"
-        f"Другие игроки могут присоединиться через /games.\n"
-        f"Когда все готовы — /startgame"
+        f"Другие игроки могут присоединиться через меню «Открытые комнаты».\n"
+        f"Когда все готовы — нажмите «Начать игру»."
     )
+
+
+async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = await _do_newgame(update.effective_user, context)
+    await update.message.reply_text(text, reply_markup=_menu_keyboard_for(update.effective_user.id))
 
 
 # ── /games — list open rooms ─────────────────────────────────
 
-async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _build_games_keyboard(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Build text + keyboard for open rooms list."""
     lobbies = [g for g in rooms.values() if g.phase == Phase.LOBBY]
     if not lobbies:
-        await update.message.reply_text("Нет открытых комнат. Создайте новую: /newgame")
-        return
+        return "Нет открытых комнат.", _menu_keyboard_for(user_id)
     buttons = []
     for g in lobbies:
-        players = ", ".join(p.display_name for p in g.players.values())
         label = f"#{g.room_id} {g.room_name} ({len(g.players)} игр.)"
         buttons.append([InlineKeyboardButton(label, callback_data=f"join:{g.room_id}")])
-    kb = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text("🎲 Открытые комнаты (нажмите чтобы войти):", reply_markup=kb)
+    buttons.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:main")])
+    return "🎲 Открытые комнаты (нажмите чтобы войти):", InlineKeyboardMarkup(buttons)
+
+
+async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = _build_games_keyboard(update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=kb)
 
 
 # ── /join callback — join a room via button ──────────────────
@@ -196,29 +266,33 @@ async def cb_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     game = rooms.get(room_id)
 
     if not game or game.phase != Phase.LOBBY:
-        await query.edit_message_text("Эта комната уже недоступна.")
+        await query.edit_message_text("Эта комната уже недоступна.", reply_markup=_menu_keyboard_for(user_id))
         return
 
     existing = _find_game_for_user(user_id)
     if existing and existing.room_id != room_id and existing.phase != Phase.FINISHED:
         await query.edit_message_text(
             f"Вы уже в комнате «{existing.room_name}» (#{existing.room_id}). "
-            f"Сначала выйдите: /cancel"
+            f"Сначала выйдите.",
+            reply_markup=_menu_keyboard_for(user_id),
         )
         return
 
     name = _name(user)
     ok, msg = game.add_player(user_id, name)
-    await query.edit_message_text(msg)
     if ok:
-        # Notify other players in the room
+        player_stats.record_join(user_id, name)
+    await query.edit_message_text(msg, reply_markup=_menu_keyboard_for(user_id))
+    if ok:
+        # Notify other players in the room (with updated menu)
         for p in game.players.values():
             if p.user_id != user_id:
                 try:
                     await context.bot.send_message(
                         p.user_id,
                         f"👋 {name} присоединился к комнате «{game.room_name}»! "
-                        f"Игроков: {len(game.players)}"
+                        f"Игроков: {len(game.players)}",
+                        reply_markup=_menu_keyboard_for(p.user_id),
                     )
                 except Exception:
                     pass
@@ -226,54 +300,61 @@ async def cb_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── /startgame — begin selection phase ───────────────────────
 
-async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
+async def _do_startgame(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """Core startgame logic. Returns error text or None on success."""
     game = _find_game_for_user(user_id)
     if not game or game.phase != Phase.LOBBY:
-        await update.message.reply_text("Вы не в комнате ожидания. Используйте /newgame или /games.")
-        return
+        return "Вы не в комнате ожидания."
     if game.creator_id != user_id:
-        await update.message.reply_text("Только создатель комнаты может начать игру.")
-        return
+        return "Только создатель комнаты может начать игру."
     ok, msg = game.can_start()
     if not ok:
-        await update.message.reply_text(msg)
-        return
+        return msg
     words = game.start_selection()
     await _send_selection_to_all(context, game, words)
+    return None
+
+
+async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = await _do_startgame(update.effective_user.id, context)
+    if err:
+        await update.message.reply_text(err, reply_markup=_menu_keyboard_for(update.effective_user.id))
 
 
 # ── /cancel — leave / cancel room ────────────────────────────
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
+async def _do_cancel(user_id: int, user, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Core cancel logic. Returns reply text."""
     game = _find_game_for_user(user_id)
     if not game:
-        await update.message.reply_text("Вы не в игре.")
-        return
+        return "Вы не в игре."
     room_name = game.room_name
     room_id = game.room_id
     if game.creator_id == user_id:
-        # Creator cancels the whole room
         del rooms[room_id]
-        await update.message.reply_text(f"Комната «{room_name}» отменена.")
         for p in game.players.values():
             if p.user_id != user_id:
                 try:
                     await context.bot.send_message(
                         p.user_id,
-                        f"❌ Комната «{room_name}» отменена создателем."
+                        f"❌ Комната «{room_name}» отменена создателем.",
+                        reply_markup=_menu_keyboard_for(p.user_id),
                     )
                 except Exception:
                     pass
+        return f"Комната «{room_name}» отменена."
     else:
-        # Player leaves
         del game.players[user_id]
-        await update.message.reply_text(f"Вы покинули комнату «{room_name}».")
         await _broadcast(
             context, game,
-            f"👤 {_name(update.effective_user)} покинул(а) комнату. Игроков: {len(game.players)}"
+            f"👤 {_name(user)} покинул(а) комнату. Игроков: {len(game.players)}"
         )
+        return f"Вы покинули комнату «{room_name}»."
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = await _do_cancel(update.effective_user.id, update.effective_user, context)
+    await update.message.reply_text(text, reply_markup=_menu_keyboard_for(update.effective_user.id))
 
 
 # ── Selection phase helpers ──────────────────────────────────
@@ -536,18 +617,36 @@ async def _show_results(context: ContextTypes.DEFAULT_TYPE, game: Game) -> None:
             text = text[:MAX_MESSAGE_LEN - 20] + "\n…(обрезано)"
         await _broadcast(context, game, text)
 
-    # Scoreboard
+    # Scoreboard with shared places
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     scoreboard = "🏆 Итоги игры:\n\n"
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (name, score, details) in enumerate(results):
-        medal = medals[i] if i < len(medals) else f"{i+1}."
+    for place, uid, name, score, details in results:
+        medal = medals.get(place, f"{place}.")
         scoreboard += f"{medal} {name} — {score} очков\n"
         for d in details:
             scoreboard += f"{d}\n"
         scoreboard += "\n"
 
-    scoreboard += "\nНовая игра — /newgame"
-    await _broadcast(context, game, scoreboard)
+    scoreboard += "\nНовая игра — нажмите «Новая игра» в меню."
+    for player in game.players.values():
+        try:
+            await context.bot.send_message(
+                player.user_id, scoreboard,
+                reply_markup=_menu_keyboard_for(player.user_id),
+            )
+        except Exception as e:
+            logger.error("Cannot DM user %s: %s", player.user_id, e)
+
+    # ── Log player stats ──
+    all_names = {p.user_id: p.display_name for p in game.players.values()}
+    for place, uid, pname, score, _ in results:
+        co_players = [n for u, n in all_names.items() if u != uid]
+        player_stats.record_game_finished(
+            user_id=uid,
+            display_name=pname,
+            is_winner=(place == 1),
+            co_player_names=co_players,
+        )
 
     # Cleanup
     del rooms[game.room_id]
@@ -580,6 +679,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     # ── Game callback handlers ──
+    app.add_handler(CallbackQueryHandler(cb_menu, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(cb_join, pattern=r"^join:"))
     app.add_handler(CallbackQueryHandler(cb_selection, pattern=r"^sel:"))
     app.add_handler(CallbackQueryHandler(cb_guess, pattern=r"^guess:"))
