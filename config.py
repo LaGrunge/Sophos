@@ -9,6 +9,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Copy .env.example to .env and fill in your token.")
 
+# ── Logging ───────────────────────────────────────────────────
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
 # ── Game settings ──────────────────────────────────────────────
 MAX_PLAYERS = int(os.getenv("MAX_PLAYERS", "10"))
 WORDS_PER_ROUND = int(os.getenv("WORDS_PER_ROUND", "10"))

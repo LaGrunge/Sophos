@@ -12,21 +12,20 @@ from telegram.ext import (
     filters,
 )
 
-from config import TELEGRAM_BOT_TOKEN, MIN_PLAYERS, REQUIRED_COMMON_WORDS
+from config import LOG_LEVEL, TELEGRAM_BOT_TOKEN, MIN_PLAYERS, REQUIRED_COMMON_WORDS
 from dictionary_parser import parse_dictionary
 from game import Game, Phase
 import player_stats
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 class _HttpxDebugFilter(logging.Filter):
-    """Downgrade httpx HTTP Request log messages from INFO to DEBUG."""
+    """Hide httpx HTTP Request log messages unless log level is DEBUG."""
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.levelno == logging.INFO and "HTTP Request" in record.getMessage():
-            record.levelno = logging.DEBUG
-            record.levelname = "DEBUG"
+        if "HTTP Request" in record.getMessage():
+            return record.levelno > logging.DEBUG or logging.getLogger().isEnabledFor(logging.DEBUG)
         return True
 
 logging.getLogger("httpx").addFilter(_HttpxDebugFilter())
